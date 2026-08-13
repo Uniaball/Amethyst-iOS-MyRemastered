@@ -246,7 +246,11 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     }
     
     [manager GET:versionManifestURL parameters:nil headers:nil progress:^(NSProgress * _Nonnull progress) {
-        self.progressViewMain.progress = progress.fractionCompleted;
+        // AFNetworking 的 progress 回调在后台线程执行，必须回主线程更新 UI，
+        // 否则会触发 "modifying the autolayout engine from a background thread" 崩溃
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.progressViewMain.progress = progress.fractionCompleted;
+        });
     } success:^(NSURLSessionTask *task, NSDictionary *responseObject) {
         [remoteVersionList addObjectsFromArray:responseObject[@"versions"]];
         NSDebugLog(@"[VersionList] Got %d versions", remoteVersionList.count);
@@ -658,7 +662,7 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     // 注意：不要在此清空 localVersionList/remoteVersionList
     // 该方法既被 JAR 执行调用，也被正常启动游戏调用；清空会导致用户返回后版本列表为空、
     // buttonInstall 短暂不可用。版本列表的生命周期应由 reloadProfileList 统一管理。
-    BOOL hasTrollStoreJIT = getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
+    BOOL hasTrollStoreJIT = getEntitlementValue(@"jb.pmap_cs.custom_trust");
 
     if (isJITEnabled(false)) {
         [ALTServerManager.sharedManager stopDiscovering];
@@ -672,6 +676,16 @@ static void *ProgressObserverContext = &ProgressObserverContext;
         NSLog(@"Debug option skipped waiting for JIT. Java might not work.");
         handler();
         return;
+    } else if (@available(iOS 17.4, *)) {
+        NSString *scriptDataString = @"";
+        if (DeviceNeedsDebugJITMapping()) {
+            NSData *scriptData = [NSData dataWithContentsOfFile:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"UniversalJIT26.js"]];
+            scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
+        }
+        [UIApplication.sharedApplication openURL:[NSURL URLWithString:[NSString stringWithFormat:@"stikjit://enable-jit?bundle-id=%@&pid=%d%@", NSBundle.mainBundle.bundleIdentifier, getpid(), scriptDataString]] options:@{} completionHandler:nil];
+    } else {
+        // Assuming 16.7-17.3.1. SideStore still lacks this URL scheme at the time of writing, so it only jumps to SideStore.
+        [UIApplication.sharedApplication openURL:[NSURL URLWithString:[NSString stringWithFormat:@"sidestore://sidejit-enable?pid=%d", getpid()]] options:@{} completionHandler:nil];
     }
 
     self.progressText.text = localize(@"launcher.wait_jit.title", nil);

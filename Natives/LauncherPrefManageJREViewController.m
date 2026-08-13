@@ -202,13 +202,21 @@ static WFWorkflowProgressView* currentProgressView;
         fileCallback:^(NSString* name) {
             NSString *completedSize = [NSByteCountFormatter stringFromByteCount:fileProgress.completedUnitCount countStyle:NSByteCountFormatterCountStyleMemory];
             NSString *totalSize = [NSByteCountFormatter stringFromByteCount:fileProgress.totalUnitCount countStyle:NSByteCountFormatterCountStyleMemory];
-            nav.progressText.text = [NSString stringWithFormat:@"(%@ / %@) %@", completedSize, totalSize, name];
-            currentProgressView.fractionCompleted = totalProgress.fractionCompleted;
+            NSString *displayText = [NSString stringWithFormat:@"(%@ / %@) %@", completedSize, totalSize, name];
+            double fraction = totalProgress.fractionCompleted;
+            // fileCallback 在 extractTarXZ 内部（后台线程）调用，
+            // UILabel.text 和 fractionCompleted 是 UI 操作，必须切回主线程。
+            dispatch_async(dispatch_get_main_queue(), ^{
+                nav.progressText.text = displayText;
+                currentProgressView.fractionCompleted = fraction;
+            });
         }];
         [url stopAccessingSecurityScopedResource];
 
         if (error) {
-            showDialog(localize(@"Error", nil), error);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                showDialog(localize(@"Error", nil), error);
+            });
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -767,8 +775,14 @@ styleForMenuWithConfiguration:(UIContextMenuConfiguration *)configuration
                     case '0':
                     case '\0': { // File
                         currFileName = @(currFileHeader.name);
-                        currFileOff = fileProgress.completedUnitCount = 0;
-                        currFileSize = fileProgress.totalUnitCount = strtol(currFileHeader.size, NULL, 8);
+                        currFileOff = 0;
+                        currFileSize = strtol(currFileHeader.size, NULL, 8);
+                        // fileProgress 被 progressViewSub.observedProgress KVO 监听，
+                        // 必须在主线程修改以避免后台线程触发布局引擎崩溃
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            fileProgress.completedUnitCount = 0;
+                            fileProgress.totalUnitCount = currFileSize;
+                        });
                         NSLog(@"[RuntimeUnpack] Extracting %@", currFileName);
                         dispatch_async(dispatch_get_main_queue(), ^{
                             fileCallback(currFileName);
@@ -802,7 +816,12 @@ styleForMenuWithConfiguration:(UIContextMenuConfiguration *)configuration
             strm.next_out = outbuf;
             strm.avail_out = sizeof(outbuf);
 
-            progress.completedUnitCount = strm.total_in;
+            // progress 被 progressViewMain.observedProgress KVO 监听，
+            // 必须在主线程修改以避免后台线程触发布局引擎崩溃
+            NSUInteger totalIn = (NSUInteger)strm.total_in;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progress.completedUnitCount = totalIn;
+            });
         }
 
         if (ret == LZMA_STREAM_END) {

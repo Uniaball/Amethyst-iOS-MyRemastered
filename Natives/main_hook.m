@@ -3,9 +3,16 @@
 #import "SurfaceViewController.h"
 #import "ios_uikit_bridge.h"
 #import "utils.h"
+#import "mach_excServer.h"
 
-#include "external/fishhook/fishhook.h"
 #include <dlfcn.h>
+#include <libgen.h>
+#include <pthread.h>
+#include "external/fishhook/fishhook.h"
+
+// 硬件断点异常端口（同步自上游，用于非 TXM 的 iOS 26+ 设备 dlopen 重定向）
+mach_port_t excPort;
+void *hooked_dlopen_26_ppl(const char *path, int mode);
 
 void (*orig_abort)();
 void (*orig_exit)(int code);
@@ -13,129 +20,10 @@ void* (*orig_dlopen)(const char* path, int mode);
 void* (*orig_dlsym)(void* handle, const char* name);
 int (*orig_open)(const char *path, int oflag, ...);
 
-// 前向声明：zink stride fix 状态变量（定义在文件后部 Vulkan stride fix 区域，
-// 但 hooked_dlopen 在文件前部就需要引用它来检测 libOSMesa 加载）
-static BOOL g_zinkStrideFixActive = NO;
-
-// ============================================================================
-// SDL3 native hook（关键修复 MC 26.3-snapshot-4+ SDL3 启动崩溃）
-// ============================================================================
-// 背景：
-//   MC 26.3-snapshot-4+ 从 GLFW 切换到 SDL3。MC 通过 LWJGL 的 SDL binding 或
-//   自己的 JNI binding 调用 SDL3 函数。LWJGL/Library.loadNative 内部用 dlsym
-//   获取 SDL3 函数指针。
-//
-//   SDL3 UIKit 后端默认创建新的 UIWindowScene，与启动器已有的
-//   GameSurfaceView（含 CAMetalLayer）冲突，导致 SDL_CreateWindow 阻塞/崩溃。
-//
-//   之前的方案是用 SDLVideo.java 覆盖类拦截 SDL_CreateWindow。但日志显示
-//   我们的 SDL.java/SDLVideo.java 覆盖类的 println 从未出现，说明 MC 不通过
-//   LWJGL 的 SDL binding 加载 SDL3（MC 26.3 可能用自己的 JNI binding）。
-//
-//   因此改为在 native 层 hook dlsym，拦截 SDL_CreateWindow 请求，返回我们的
-//   hook 函数。hook 函数调用 amethyst_sdl_create_window_with_scene（egl_bridge.m），
-//   通过 SDL3 Properties API 传入启动器的 UIWindowScene，让 SDL3 复用启动器的
-//   窗口场景。
-
-// SDL_Window 不透明类型（避免依赖 SDL3 头文件）
-struct SDL_Window;
-typedef struct SDL_Window SDL_Window;
-
-// 由 egl_bridge.m 提供：用启动器 UIWindowScene 创建 SDL3 窗口
-extern SDL_Window *amethyst_sdl_create_window_with_scene(int w, int h, unsigned int flags);
-
-// 原始 SDL_CreateWindow 函数指针（dlsym hook 捕获后保存）
-static SDL_Window *(*g_orig_sdl_CreateWindow)(const char *, int, int, unsigned int) = NULL;
-
-// ============================================================================
-// SDL_InitSubSystem hook（参照 Amethyst-Android feat/lwjgl3ify-sdl-support 分支）
-// ============================================================================
-// 背景：
-//   MC 26.3-snapshot-4+ 用 SDL3 替代 GLFW。MC 启动时调用 SDL_Init / SDL_InitSubSystem
-//   初始化 SDL3 子系统（video/gamepad/joystick/events 等）。
-//
-//   Android 仓库的 sdl_hook.c 在 SDL_InitSubSystem 被调用时：
-//     1. 通过 JNI 调用 CallbackBridge.notifyLauncher(SDL, INIT) 通知启动器
-//     2. 设置 SDL_RETURN_KEY_HIDES_IME=true hint（让 Return 键隐藏软键盘，避免
-//        MC 误处理 IME 事件导致输入异常）
-//     3. 调用原始 SDL_InitSubSystem
-//
-//   iOS 移植：不需要 JNI 通知（iOS 启动器与 MC 在同一进程，直接共享状态），
-//   但 SDL_RETURN_KEY_HIDES_IME hint 必须设置，否则 MC 26.3-snapshot-4 的
-//   软键盘输入会卡住，可能导致启动时输入框阻塞主线程。
-
-// SDL3 函数指针类型
-typedef int SDL_bool;                    // SDL_bool = int (SDL_TRUE=1, SDL_FALSE=0)
-typedef unsigned int SDL_InitFlags;      // SDL_InitFlags = Uint32
-typedef int (*SDL_InitSubSystem_t)(SDL_InitFlags flags);
-typedef SDL_bool (*SDL_SetHint_t)(const char *name, const char *value);
-
-// 原始 SDL_InitSubSystem / SDL_SetHint 函数指针
-static SDL_InitSubSystem_t g_orig_sdl_InitSubSystem = NULL;
-static SDL_SetHint_t g_orig_sdl_SetHint = NULL;
-static BOOL g_sdl3_init_hook_done = NO;
-
-/// hook 函数：替换 SDL_InitSubSystem
-/// 签名：int SDL_InitSubSystem(Uint32 flags)
-static int amethyst_hooked_SDL_InitSubSystem(unsigned int flags) {
-    NSLog(@"[SDL3 Hook] SDL_InitSubSystem intercepted: flags=0x%x", flags);
-
-    // 首次调用时设置 SDL_RETURN_KEY_HIDES_IME hint（参照 Android 仓库 sdl_hook.c）
-    // 这必须在调用原始 SDL_InitSubSystem 之前设置，确保 hint 在 SDL 初始化时生效
-    if (!g_sdl3_init_hook_done) {
-        g_sdl3_init_hook_done = YES;
-        if (g_orig_sdl_SetHint) {
-            // SDL_RETURN_KEY_HIDES_IME=true：按 Return 键隐藏 IME
-            // Android 仓库注释："This is the normal for the launcher, the default in SDL is false."
-            g_orig_sdl_SetHint("SDL_RETURN_KEY_HIDES_IME", "true");
-            NSLog(@"[SDL3 Hook] Set SDL_RETURN_KEY_HIDES_IME=true");
-
-            // 额外设置 iOS 专用 hints
-            // SDL_HINT_IOS_HIDE_HOME_INDICATOR=1：隐藏 home indicator（沉浸式游戏体验）
-            g_orig_sdl_SetHint("SDL_IOS_HIDE_HOME_INDICATOR", "1");
-            // SDL_HINT_MOUSE_TOUCH_EVENTS=0：禁用鼠标模拟触摸事件（避免输入冲突）
-            g_orig_sdl_SetHint("SDL_MOUSE_TOUCH_EVENTS", "0");
-            // SDL_HINT_TOUCH_MOUSE_EVENTS=0：禁用触摸模拟鼠标事件（启动器自己处理触摸）
-            g_orig_sdl_SetHint("SDL_TOUCH_MOUSE_EVENTS", "0");
-            NSLog(@"[SDL3 Hook] Set iOS-specific SDL hints (hide home indicator, disable mouse/touch cross-events)");
-        } else {
-            NSLog(@"[SDL3 Hook] WARNING: SDL_SetHint not available, cannot set SDL_RETURN_KEY_HIDES_IME");
-        }
-    }
-
-    // 调用原始 SDL_InitSubSystem
-    if (!g_orig_sdl_InitSubSystem) {
-        // 首次调用时通过 orig_dlsym 获取原始函数指针
-        void *sdl_lib = dlopen("@rpath/libSDL3.dylib", RTLD_NOLOAD | RTLD_GLOBAL);
-        if (!sdl_lib) {
-            sdl_lib = dlopen("libSDL3.dylib", RTLD_NOLOAD | RTLD_GLOBAL);
-        }
-        if (sdl_lib && orig_dlsym) {
-            g_orig_sdl_InitSubSystem = (SDL_InitSubSystem_t)orig_dlsym(sdl_lib, "SDL_InitSubSystem");
-            g_orig_sdl_SetHint = (SDL_SetHint_t)orig_dlsym(sdl_lib, "SDL_SetHint");
-            NSLog(@"[SDL3 Hook] Resolved original SDL_InitSubSystem=%p, SDL_SetHint=%p",
-                  (void*)g_orig_sdl_InitSubSystem, (void*)g_orig_sdl_SetHint);
-        }
-    }
-
-    if (g_orig_sdl_InitSubSystem) {
-        int result = g_orig_sdl_InitSubSystem(flags);
-        NSLog(@"[SDL3 Hook] Original SDL_InitSubSystem returned: %d", result);
-        return result;
-    }
-
-    NSLog(@"[SDL3 Hook] FATAL: Original SDL_InitSubSystem not found, returning -1");
-    return -1;
-}
-
-/// fishhook 版本的 SDL_InitSubSystem hook
-static int amethyst_fishhook_SDL_InitSubSystem(unsigned int flags) {
-    return amethyst_hooked_SDL_InitSubSystem(flags);
-}
-
-/// 提供给 egl_bridge.m 使用的"绕过 hook"的 dlsym
-/// egl_bridge.m 在获取 SDL3 函数指针时必须调用此函数，否则会被 hooked_dlsym
-/// 拦截（SDL_CreateWindow 请求会返回 hook 函数，导致无限递归）。
+/// 提供给 zink stride fix 使用的"绕过 hook"的 dlsym
+/// amethyst_vkGetInstanceProcAddr / amethyst_vkGetDeviceProcAddr 内部查找
+/// 真实 Vulkan 函数指针时必须调用此函数，否则会被 hooked_dlsym 拦截（返回
+/// 我们的 wrapper），导致无限递归。
 void *amethyst_orig_dlsym(void *handle, const char *name) {
     if (orig_dlsym) {
         return orig_dlsym(handle, name);
@@ -144,23 +32,18 @@ void *amethyst_orig_dlsym(void *handle, const char *name) {
     return dlsym(handle, name);
 }
 
-/// hook 函数：替换 SDL_CreateWindow
-/// 签名必须与 SDL3 的 SDL_CreateWindow 完全一致：
-///   SDL_Window *SDL_CreateWindow(const char *title, int w, int h, Uint32 flags)
-static SDL_Window *amethyst_hooked_SDL_CreateWindow(const char *title, int w, int h, unsigned int flags) {
-    NSLog(@"[SDL3 Hook] SDL_CreateWindow intercepted: title=%s w=%d h=%d flags=0x%x",
-          title ? title : "(null)", w, h, flags);
-    // 调用我们的桥接函数（会用 Properties API 传入 UIWindowScene）
-    SDL_Window *window = amethyst_sdl_create_window_with_scene(w, h, flags);
-    NSLog(@"[SDL3 Hook] amethyst_sdl_create_window_with_scene returned: %p", window);
-    return window;
-}
+// 前向声明：zink stride fix 状态变量（定义在文件后部 Vulkan stride fix 区域，
+// 但 hooked_dlopen 在文件前部就需要引用它来检测 libOSMesa 加载）
+static BOOL g_zinkStrideFixActive = NO;
 
 void handle_fatal_exit(int code) {
     if (NSThread.isMainThread) {
         return;
     }
 
+    // 注意：本仓库 PLLogOutputView.handleExitCode: 返回 void（项目自定义的
+    // PLCrashView 集成），不能照搬上游的 if (![PLLogOutputView handleExitCode:code]) return;
+    // 检查。这里直接调用，让 PLCrashView 内部决定是否展示崩溃界面。
     [PLLogOutputView handleExitCode:code];
 
     if (fatalExitGroup != nil) {
@@ -204,41 +87,147 @@ void hooked_exit(int code) {
 }
 
 void* hooked_dlopen(const char* path, int mode) {
+    // 同步自上游：非 TXM 的 iOS 26+ 设备需要硬件断点重定向（hooked_dlopen_26_ppl）
+    BOOL shouldUseDyldBypass26PPL = NO;
+    if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED)) {
+        shouldUseDyldBypass26PPL = hwRedirectOrig[0] && !DeviceHasJITFlags(JIT_FLAG_HAS_TXM);
+    }
+    // Only patch Mach-O and use dyld bypass dylib is in the home dir
+    // or tmp dir: LiveContainer makes a symlink to its own tmp dir so checking home dir alone would fail
     const char *home = getenv("HOME");
-    // Only proceed to check if dylib is in the home dir
+    const char *tmp = getenv("TMPDIR");
     char fullpath[PATH_MAX];
-    if (!path || !realpath(path, fullpath) || !strstr(fullpath, home)) {
-        // 即使 path 不在 home 目录，也检查是否是 libSDL3.dylib
-        // MC 26.3-snapshot-4+ 加载 libSDL3.dylib 后，需要立即对 SDL_CreateWindow
-        // 进行 fishhook 符号重绑定（dlsym hook 对 MC 的 SDL3 调用方式无效）
-        void *handle = orig_dlopen(path, mode);
-        if (handle && path && strstr(path, "libSDL3")) {
-            NSLog(@"[SDL3 Hook] libSDL3.dylib loaded via dlopen, rebinding SDL_CreateWindow via fishhook");
-            // 重新注册所有 hook，包括 SDL_CreateWindow
-            init_hookFunctions();
-        }
-        // Zink stride fix：libOSMesa 加载后重新执行 fishhook，捕获其对
-        // vkGetInstanceProcAddr / vkGetDeviceProcAddr 的符号引用
-        // （installZinkStrideFix 在 libOSMesa 加载前调用，初次 rebind 无法
-        //  捕获 libOSMesa image 内的引用；必须在其加载后再次 rebind）
-        if (handle && path && strstr(path, "libOSMesa") && g_zinkStrideFixActive) {
-            NSLog(@"[ZinkStrideFix] libOSMesa loaded via dlopen, re-rebinding Vulkan symbols");
-            rebindZinkStrideFixForNewImage();
-        }
-        return handle;
+    BOOL shouldUseDyldBypass = path && realpath(path, fullpath) && (strstr(fullpath, home) || (tmp && strstr(fullpath, tmp)));
+    shouldUseDyldBypass26PPL &= shouldUseDyldBypass;
+
+    // 同步自上游：在分支前统一调用 PLPatchMachOPlatformForFile
+    // （原实现仅在 shouldUseDyldBypass 分支调用，遗漏了 26PPL 路径，
+    //  会导致 iOS 26+ 非 TXM 设备的 dyld bypass 失败）
+    if (shouldUseDyldBypass) {
+        PLPatchMachOPlatformForFile(path);
     }
 
-    PLPatchMachOPlatformForFile(path);
-    void *handle = orig_dlopen(path, mode);
-    if (handle && path && strstr(path, "libSDL3")) {
-        NSLog(@"[SDL3 Hook] libSDL3.dylib loaded via dlopen (home), rebinding SDL_CreateWindow via fishhook");
-        init_hookFunctions();
+    // fork 自有特性：Zink stride fix——libOSMesa 加载后重新执行 fishhook，
+    // 捕获其对 vkGetInstanceProcAddr / vkGetDeviceProcAddr 的符号引用
+    // （installZinkStrideFix 在 libOSMesa 加载前调用，初次 rebind 无法
+    //  捕获 libOSMesa image 内的引用；必须在其加载后再次 rebind）
+    BOOL needsZinkRebind = path && strstr(path, "libOSMesa") && g_zinkStrideFixActive;
+
+    void *handle;
+    if (shouldUseDyldBypass26PPL) {
+        if (needsZinkRebind) {
+            handle = hooked_dlopen_26_ppl(path, mode);
+        } else {
+            __attribute__((musttail)) return hooked_dlopen_26_ppl(path, mode);
+        }
+    } else if (shouldUseDyldBypass) {
+        // Special case for LiveContainer multitask mode where it hooks dlopen to hook mmap,
+        // which will break this dyld bypass, so we redirect calls to the original dlopen.
+        static void *(*sys_dlopen)(const char *, int);
+        if(!sys_dlopen) sys_dlopen = dlsym(RTLD_NEXT, "dlopen");
+        if (needsZinkRebind) {
+            handle = sys_dlopen(path, mode);
+        } else {
+            __attribute__((musttail)) return sys_dlopen(path, mode);
+        }
+    } else {
+        if (needsZinkRebind) {
+            handle = orig_dlopen(path, mode);
+        } else {
+            __attribute__((musttail)) return orig_dlopen(path, mode);
+        }
     }
-    if (handle && path && strstr(path, "libOSMesa") && g_zinkStrideFixActive) {
-        NSLog(@"[ZinkStrideFix] libOSMesa loaded via dlopen (home), re-rebinding Vulkan symbols");
+
+    // Zink stride fix rebind（仅在 needsZinkRebind 时执行）
+    if (handle && needsZinkRebind) {
+        NSLog(@"[ZinkStrideFix] libOSMesa loaded via dlopen, re-rebinding Vulkan symbols");
         rebindZinkStrideFixForNewImage();
     }
     return handle;
+}
+
+// ============================================================================
+// 硬件断点 dlopen 重定向（同步自上游，用于非 TXM 的 iOS 26+ 设备）
+// 当 redirectFunctionHWBreakpoint 被选中时，dlopen 需要通过硬件断点 + Mach 异常
+// 来重定向 dyld 内的 mmap/fcntl 调用，因为此时无法直接修改 dyld 代码段。
+// ============================================================================
+void *exception_handler(void *unused) {
+    mach_msg_server(mach_exc_server, sizeof(union __RequestUnion__catch_mach_exc_subsystem), excPort, MACH_MSG_OPTION_NONE);
+    abort();
+}
+
+void *hooked_dlopen_26_ppl(const char *path, int mode) {
+    if (!excPort) {
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort);
+        mach_port_insert_right(mach_task_self(), excPort, excPort, MACH_MSG_TYPE_MAKE_SEND);
+        pthread_t thread;
+        pthread_create(&thread, NULL, exception_handler, NULL);
+    }
+
+    // save old thread states
+    exception_mask_t mask = EXC_MASK_BREAKPOINT;
+    mach_msg_type_number_t masksCnt = 1;
+    exception_handler_t handler = excPort;
+    exception_behavior_t behavior = EXCEPTION_STATE | MACH_EXCEPTION_CODES;
+    thread_state_flavor_t flavor = ARM_THREAD_STATE64;
+    arm_debug_state64_t origDebugState;
+    mach_port_t thread = mach_thread_self();
+    thread_get_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&origDebugState, &(mach_msg_type_number_t){ARM_DEBUG_STATE64_COUNT});
+    thread_swap_exception_ports(thread, mask, handler, behavior, flavor, &mask, &masksCnt, &handler, &behavior, &flavor);
+    if (masksCnt != 1) {
+        NSLog(@"main_hook: Expected 1 exception port, got %d. HW breakpoint hook may fail.", masksCnt);
+    }
+
+    // hook stuff. this will overwrite LiveContainer private container multitask's hook, we will load __TEXT using JIT inside
+    arm_debug_state64_t hookDebugState = {0};
+    for(int i = 0; i < 6 && hwRedirectOrig[i]; i++) {
+        hookDebugState.__bvr[i] = (uint64_t)hwRedirectOrig[i];
+        hookDebugState.__bcr[i] = 0x1e5;
+    }
+    thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&hookDebugState, ARM_DEBUG_STATE64_COUNT);
+
+    // fixup @loader_path since we cannot use musttail here
+    void *result;
+    void *callerAddr = __builtin_return_address(0);
+    struct dl_info info;
+    if (path && !strncmp(path, "@loader_path/", 13) && dladdr(callerAddr, &info)) {
+        char resolvedPath[PATH_MAX];
+        snprintf(resolvedPath, sizeof(resolvedPath), "%s/%s", dirname((char *)info.dli_fname), path + 13);
+        result = orig_dlopen(resolvedPath, mode);
+    } else {
+        result = orig_dlopen(path, mode);
+    }
+
+    // restore old thread states
+    thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&origDebugState, ARM_DEBUG_STATE64_COUNT);
+    thread_swap_exception_ports(thread, mask, handler, behavior, flavor, &mask, &masksCnt, &handler, &behavior, &flavor);
+
+    return result;
+}
+
+kern_return_t catch_mach_exception_raise_state(mach_port_t exception_port, exception_type_t exception, const mach_exception_data_t code, mach_msg_type_number_t codeCnt, int *flavor, const thread_state_t old_state, mach_msg_type_number_t old_stateCnt, thread_state_t new_state, mach_msg_type_number_t *new_stateCnt) {
+    arm_thread_state64_t *old = (arm_thread_state64_t *)old_state;
+    arm_thread_state64_t *new = (arm_thread_state64_t *)new_state;
+    uint64_t pc = arm_thread_state64_get_pc(*old);
+
+    for(int i = 0; i < 6 && hwRedirectOrig[i]; i++) {
+        if(pc == (uint64_t)hwRedirectOrig[i]) {
+            *new = *old;
+            *new_stateCnt = old_stateCnt;
+            arm_thread_state64_set_pc_fptr(*new, hwRedirectTarget[i]);
+            return KERN_SUCCESS;
+        }
+    }
+    NSLog(@"[DyldLVBypass] Unknown breakpoint at pc: %p", (void*)pc);
+    return KERN_FAILURE;
+}
+
+kern_return_t catch_mach_exception_raise(mach_port_t exception_port, mach_port_t thread, mach_port_t task, exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t codeCnt) {
+    abort();
+}
+
+kern_return_t catch_mach_exception_raise_state_identity(mach_port_t exception_port, mach_port_t thread, mach_port_t task, exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t codeCnt, int *flavor, thread_state_t old_state, mach_msg_type_number_t old_stateCnt, thread_state_t new_state, mach_msg_type_number_t *new_stateCnt) {
+    abort();
 }
 
 // ============================================================================
@@ -424,7 +413,7 @@ static VkZPipeline allocDummyPipeline(void) {
     return (VkZPipeline)handle;
 }
 
-// 前向声明（供 hooked_dlsym 使用）
+// 前向声明（供 zinkStrideFixRebind 使用）
 static void* amethyst_vkGetInstanceProcAddr(VkZInstance instance, const char* pName);
 static void* amethyst_vkGetDeviceProcAddr(VkZDevice device, const char* pName);
 static VkZResult amethyst_vkCreateGraphicsPipelines(
@@ -713,6 +702,8 @@ static VkZResult amethyst_vkCreateGraphicsPipelines(
                 g_real_vkGetInstanceProcAddr((VkZInstance)NULL, "vkCreateGraphicsPipelines");
         }
         if (!g_real_vkCreateGraphicsPipelines) {
+            // 通过 amethyst_orig_dlsym 绕过 hook（虽然 hooked_dlsym 不拦截此函数名，
+            // 但保持一致性，避免未来扩展 hook 列表时引入递归）
             g_real_vkCreateGraphicsPipelines = (PFN_zkCreateGraphicsPipelines)
                 amethyst_orig_dlsym(RTLD_DEFAULT, "vkCreateGraphicsPipelines");
         }
@@ -890,6 +881,8 @@ static void* amethyst_vkGetInstanceProcAddr(VkZInstance instance, const char* pN
         }
     }
     if (!g_real_vkGetInstanceProcAddr) {
+        // 关键：必须用 amethyst_orig_dlsym 绕过 hooked_dlsym，否则 pName
+        // 恰好是 "vkGetInstanceProcAddr" 时会触发无限递归
         return amethyst_orig_dlsym(RTLD_DEFAULT, pName);
     }
     return g_real_vkGetInstanceProcAddr(instance, pName);
@@ -966,6 +959,8 @@ static void* amethyst_vkGetDeviceProcAddr(VkZDevice device, const char* pName) {
         }
     }
     if (!g_real_vkGetDeviceProcAddr) {
+        // 关键：必须用 amethyst_orig_dlsym 绕过 hooked_dlsym，否则 pName
+        // 恰好是 "vkGetDeviceProcAddr" 时会触发无限递归
         return amethyst_orig_dlsym(RTLD_DEFAULT, pName);
     }
     return g_real_vkGetDeviceProcAddr(device, pName);
@@ -1091,59 +1086,30 @@ void rebindZinkStrideFixForNewImage(void) {
     NSLog(@"[ZinkStrideFix] Re-rebound Vulkan symbols for newly loaded image");
 }
 
-/// dlsym hook：拦截 SDL3 / Vulkan 关键函数请求，返回我们的 hook 函数
+/// dlsym hook：拦截 Vulkan loader 函数请求，返回我们的 wrapper
 ///
-/// 拦截的函数：
-///   - SDL_CreateWindow → 返回 amethyst_hooked_SDL_CreateWindow
-///     （让 SDL3 UIKit 后端复用启动器的 UIWindowScene）
-///   - vkGetInstanceProcAddr / vkGetDeviceProcAddr → 返回我们的 wrapper
-///     （zink stride fix：拦截 vkCreateGraphicsPipelines 调用）
+/// 仅拦截 zink stride fix 相关函数：
+///   - vkGetInstanceProcAddr → 返回 amethyst_vkGetInstanceProcAddr
+///     （拦截 vkCreateGraphicsPipelines 调用，强制 stride 4 字节对齐）
+///   - vkGetDeviceProcAddr → 返回 amethyst_vkGetDeviceProcAddr
+///     （拦截 vkCmd* / vkDestroyPipeline 调用，跟踪 dummy pipeline）
 ///
 /// 其他函数正常返回 orig_dlsym 的结果，避免日志爆炸。
 void* hooked_dlsym(void* handle, const char* name) {
-    if (name != NULL) {
-        // Zink stride fix：拦截 Vulkan loader 函数查找
-        if (g_zinkStrideFixActive) {
-            if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
-                if (!g_real_vkGetInstanceProcAddr) {
-                    g_real_vkGetInstanceProcAddr = (PFN_zkGetInstanceProcAddr)orig_dlsym(handle, name);
-                }
-                NSLog(@"[ZinkStrideFix] dlsym intercepted: vkGetInstanceProcAddr -> hook");
-                return (void*)amethyst_vkGetInstanceProcAddr;
+    if (name != NULL && g_zinkStrideFixActive) {
+        if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
+            if (!g_real_vkGetInstanceProcAddr) {
+                g_real_vkGetInstanceProcAddr = (PFN_zkGetInstanceProcAddr)orig_dlsym(handle, name);
             }
-            if (strcmp(name, "vkGetDeviceProcAddr") == 0) {
-                if (!g_real_vkGetDeviceProcAddr) {
-                    g_real_vkGetDeviceProcAddr = (PFN_zkGetDeviceProcAddr)orig_dlsym(handle, name);
-                }
-                NSLog(@"[ZinkStrideFix] dlsym intercepted: vkGetDeviceProcAddr -> hook");
-                return (void*)amethyst_vkGetDeviceProcAddr;
-            }
+            NSLog(@"[ZinkStrideFix] dlsym intercepted: vkGetInstanceProcAddr -> hook");
+            return (void*)amethyst_vkGetInstanceProcAddr;
         }
-
-        if (strcmp(name, "SDL_CreateWindow") == 0) {
-            NSLog(@"[SDL3 Hook] dlsym intercepted: SDL_CreateWindow -> returning hook");
-            // 首次拦截时，用 orig_dlsym 获取原始函数指针并保存
-            // （amethyst_sdl_create_window_with_scene 内部会通过 amethyst_orig_dlsym
-            //  重新获取 SDL3 函数指针，这里保存只是为了诊断/备份用途）
-            if (!g_orig_sdl_CreateWindow && orig_dlsym) {
-                g_orig_sdl_CreateWindow = (SDL_Window *(*)(const char *, int, int, unsigned int))
-                    orig_dlsym(handle, name);
-                NSLog(@"[SDL3 Hook] Original SDL_CreateWindow saved: %p", (void *)g_orig_sdl_CreateWindow);
+        if (strcmp(name, "vkGetDeviceProcAddr") == 0) {
+            if (!g_real_vkGetDeviceProcAddr) {
+                g_real_vkGetDeviceProcAddr = (PFN_zkGetDeviceProcAddr)orig_dlsym(handle, name);
             }
-            return (void *)amethyst_hooked_SDL_CreateWindow;
-        }
-
-        // SDL_InitSubSystem hook（参照 Android 仓库 sdl_hook.c）
-        // MC 26.3-snapshot-4+ 启动时调用 SDL_Init / SDL_InitSubSystem 初始化子系统
-        if (strcmp(name, "SDL_InitSubSystem") == 0) {
-            NSLog(@"[SDL3 Hook] dlsym intercepted: SDL_InitSubSystem -> returning hook");
-            if (!g_orig_sdl_InitSubSystem && orig_dlsym) {
-                g_orig_sdl_InitSubSystem = (SDL_InitSubSystem_t)orig_dlsym(handle, name);
-                g_orig_sdl_SetHint = (SDL_SetHint_t)orig_dlsym(handle, "SDL_SetHint");
-                NSLog(@"[SDL3 Hook] Original SDL_InitSubSystem=%p, SDL_SetHint=%p",
-                      (void*)g_orig_sdl_InitSubSystem, (void*)g_orig_sdl_SetHint);
-            }
-            return (void *)amethyst_hooked_SDL_InitSubSystem;
+            NSLog(@"[ZinkStrideFix] dlsym intercepted: vkGetDeviceProcAddr -> hook");
+            return (void*)amethyst_vkGetDeviceProcAddr;
         }
     }
     return orig_dlsym(handle, name);
@@ -1161,35 +1127,7 @@ int hooked_open(const char *path, int oflag, ...) {
     return orig_open(path, oflag, mode);
 }
 
-// 原始 SDL_CreateWindow 函数指针（fishhook 捕获后保存）
-// 与 g_orig_sdl_CreateWindow 不同，这个是从 fishhook rebind 捕获的
-static SDL_Window *(*g_fishhook_orig_sdl_CreateWindow)(const char *, int, int, unsigned int) = NULL;
-
-/// fishhook 版本的 SDL_CreateWindow hook
-/// 与 dlsym hook 的 amethyst_hooked_SDL_CreateWindow 功能相同，
-/// 但通过 fishhook 的符号重绑定机制拦截，不需要 dlsym。
-/// 这对 MC 26.3-snapshot-4+ 通过 LWJGL SharedLibrary.getFunctionAddress
-/// 或 JNA 直接获取 SDL_CreateWindow 地址的方式有效。
-static SDL_Window *amethyst_fishhook_SDL_CreateWindow(const char *title, int w, int h, unsigned int flags) {
-    NSLog(@"[SDL3 Hook] fishhook SDL_CreateWindow intercepted: title=%s w=%d h=%d flags=0x%x",
-          title ? title : "(null)", w, h, flags);
-    // 调用我们的桥接函数（会用 Properties API 传入 UIWindowScene）
-    SDL_Window *window = amethyst_sdl_create_window_with_scene(w, h, flags);
-    NSLog(@"[SDL3 Hook] fishhook amethyst_sdl_create_window_with_scene returned: %p", window);
-    return window;
-}
-
 void init_hookFunctions() {
-    // 检查窗口后端模式：AMETHYST_WINDOWING_BACKEND 由 JavaLauncher.m 设置
-    //   - "sdl"  → SDL3 模式（MC 26.3-snapshot-4+），需要 SDL_CreateWindow/SDL_InitSubSystem hook
-    //   - "glfw" → GLFW 模式（MC 26.3-snapshot-3 及以下），不需要 SDL3 hook
-    //   - 未设置 → 早期调用（main.m 中 UIApplicationMain 之前），保守注册所有 hook
-    //     （libSDL3 还未加载，SDL3 hook 不会有实际副作用；后续 libSDL3 加载时
-    //      会通过 hooked_dlopen 再次调用 init_hookFunctions 补充注册）
-    const char *windowingBackend = getenv("AMETHYST_WINDOWING_BACKEND");
-    BOOL registerSDL3Hooks = (windowingBackend == NULL) || (strcmp(windowingBackend, "sdl") == 0);
-
-    // 基础 hook（始终注册）
     struct rebinding rebindings[] = (struct rebinding[]){
         {"abort", hooked_abort, (void *)&orig_abort},
         {"__assert_rtn", hooked___assert_rtn, NULL},
@@ -1198,65 +1136,5 @@ void init_hookFunctions() {
         {"dlsym", hooked_dlsym, (void *)&orig_dlsym},
         {"open", hooked_open, (void *)&orig_open},
     };
-    size_t rebindings_count = sizeof(rebindings)/sizeof(struct rebinding);
-
-    // SDL3 hook（仅 SDL3 模式或未确定模式时注册）
-    // SDL_CreateWindow：MC 26.3-snapshot-4+ 不通过 dlsym 获取，而是通过 LWJGL
-    //   SharedLibrary.getFunctionAddress 或 JNA，fishhook 可直接修改符号表引用
-    // SDL_InitSubSystem：参照 Android 仓库 sdl_hook.c，拦截 MC 调用 SDL_Init/
-    //   SDL_InitSubSystem，设置 SDL_RETURN_KEY_HIDES_IME 等 hints
-    struct rebinding sdl3_rebindings[] = (struct rebinding[]){
-        {"SDL_CreateWindow", amethyst_fishhook_SDL_CreateWindow, (void *)&g_fishhook_orig_sdl_CreateWindow},
-        {"SDL_InitSubSystem", amethyst_fishhook_SDL_InitSubSystem, NULL}
-    };
-    size_t sdl3_rebindings_count = sizeof(sdl3_rebindings)/sizeof(struct rebinding);
-
-    if (registerSDL3Hooks) {
-        // 合并基础 hook 和 SDL3 hook 一起注册
-        struct rebinding all_rebindings[sizeof(rebindings)/sizeof(struct rebinding) +
-                                         sizeof(sdl3_rebindings)/sizeof(struct rebinding)];
-        memcpy(all_rebindings, rebindings, sizeof(rebindings));
-        memcpy(all_rebindings + rebindings_count, sdl3_rebindings, sizeof(sdl3_rebindings));
-        rebind_symbols(all_rebindings, rebindings_count + sdl3_rebindings_count);
-        NSLog(@"[main_hook] fishhook registered: base hooks + SDL3 hooks (SDL_CreateWindow + SDL_InitSubSystem), backend=%s",
-              windowingBackend ? windowingBackend : "<unset>");
-    } else {
-        // GLFW 模式：仅注册基础 hook，不注册 SDL3 hook
-        rebind_symbols(rebindings, rebindings_count);
-        NSLog(@"[main_hook] fishhook registered: base hooks only (GLFW mode, SDL3 hooks skipped)");
-    }
-
-    // 注意：不在此处预加载 libSDL3.dylib。
-    //
-    // 历史问题：commit 3a837cc 曾在 init_hookFunctions 中主动 dlopen
-    // libSDL3.dylib。但 init_hookFunctions 在 main() 中于 UIApplicationMain
-    // 之前被调用（main.m 第 324 行）。SDL3 dylib 的 constructor 会初始化
-    // UIKit 后端（注册 SDLUIKitDelegate / SDL main hook），在 UIApplicationMain
-    // 之前加载会干扰 UIApplication / UIScene 的正常初始化，导致：
-    //   1. SceneDelegate.scene:willConnectToSession: 不被正确调用 → 白屏
-    //   2. requestGeometryUpdateWithPreferences 不执行 → 强制横屏失效
-    //
-    // 现在依赖 hooked_dlopen 拦截 libSDL3 的加载（无论 MC 通过 LWJGL
-    // Library.loadNative / JNA / 自己的 JNI binding，最终都通过 dlopen
-    // 加载 dylib，会被 hooked_dlopen 拦截并触发 rebind_symbols）。
-    // 如需额外保障，可在 launchMinecraft 中调用 amethyst_preloadSDL3ForHook()。
-}
-
-/// 主动预加载 libSDL3.dylib 并重绑定符号（供启动 MC 时调用）
-/// 必须在 UIApplicationMain 之后调用（例如 SurfaceViewController.launchMinecraft），
-/// 避免在 UIApplication 启动前加载 SDL3 干扰 UIKit 初始化。
-void amethyst_preloadSDL3ForHook(void) {
-    void *sdl_lib = dlopen("@rpath/libSDL3.dylib", RTLD_NOLOAD | RTLD_GLOBAL);
-    if (!sdl_lib) {
-        sdl_lib = dlopen("@rpath/libSDL3.dylib", RTLD_LAZY | RTLD_GLOBAL);
-        if (sdl_lib) {
-            NSLog(@"[SDL3 Hook] libSDL3.dylib preloaded via amethyst_preloadSDL3ForHook, rebinding all images");
-            init_hookFunctions();
-        } else {
-            NSLog(@"[SDL3 Hook] libSDL3.dylib preload failed in amethyst_preloadSDL3ForHook: %s", dlerror());
-        }
-    } else {
-        NSLog(@"[SDL3 Hook] libSDL3.dylib already loaded in amethyst_preloadSDL3ForHook, rebinding all images");
-        init_hookFunctions();
-    }
+    rebind_symbols(rebindings, sizeof(rebindings)/sizeof(struct rebinding));
 }

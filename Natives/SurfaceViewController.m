@@ -24,7 +24,8 @@
 #import "ios_uikit_bridge.h"
 #import "LanPortDetector.h"
 #import "BackgroundManager.h"
-#import "MultiplayerManager.h"
+// ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
+// #import "MultiplayerManager.h"
 
 #include "glfw_keycodes.h"
 #include "utils.h"
@@ -987,7 +988,7 @@ static GameSurfaceView* pojavWindow;
     CGFloat screenScale = UIScreen.mainScreen.scale;
     [self updateSavedResolution];
 
-    self.rootView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.frame.size.width, self.view.frame.size.height)];
+    self.rootView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.frame.size.width + 30.0, self.view.frame.size.height)];
     [self.view addSubview:self.rootView];
 
     self.ctrlView = [[ControlLayout alloc] initWithFrame:getSafeArea(self.view.frame)];
@@ -1382,7 +1383,7 @@ static GameSurfaceView* pojavWindow;
 
 - (void)launchMinecraft {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // Validate metadata first（SDL3 预加载需要版本信息）
+        // Validate metadata first
         if (!self.metadata) {
             NSLog(@"[SurfaceViewController] Error: metadata is nil");
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -1390,18 +1391,6 @@ static GameSurfaceView* pojavWindow;
                 showDialog(localize(@"Error", nil), @"æ¸¸æçæ®å è½½å¤±è´¥ï¼è¯·éæ°éæ©çæ¬");
             });
             return;
-        }
-
-        // 仅对 SDL3 版本（MC 26.3-snapshot-4+）预加载 libSDL3.dylib 并重绑定符号。
-        // GLFW 版本（1.21.1 等）不需要 SDL3，加载它会初始化 SDL3 UIKit 后端，
-        // 与启动器的 GameSurfaceView/UIScene 冲突，可能导致渲染异常。
-        // 必须在 UIApplicationMain 之后调用，避免 SDL3 constructor 干扰 UIKit 初始化。
-        NSString *versionId = self.metadata[@"id"];
-        if (amethyst_isSDL3Version(versionId)) {
-            NSLog(@"[SurfaceViewController] SDL3 version detected (%@), preloading libSDL3.dylib", versionId);
-            amethyst_preloadSDL3ForHook();
-        } else {
-            NSLog(@"[SurfaceViewController] GLFW version detected (%@), skipping SDL3 preload", versionId);
         }
 
         // Validate window dimensions
@@ -1617,7 +1606,7 @@ static GameSurfaceView* pojavWindow;
     [alert addAction:[UIAlertAction actionWithTitle:localize(@"launch.cancel_confirm_yes", @"确认取消")
                                               style:UIAlertActionStyleDestructive
                                             handler:^(UIAlertAction *action) {
-        NSLog(@"[SurfaceViewController] 用户取消启动");
+        NSLog(@"[SurfaceViewController] User cancelled launch");
         // 移除遮罩层
         [self dismissLaunchOverlayOnError];
         // 返回启动器
@@ -1741,7 +1730,7 @@ static GameSurfaceView* pojavWindow;
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
 {
     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
-        self.rootView.bounds = CGRectMake(0, 0, size.width, size.height);
+        self.rootView.bounds = CGRectMake(0, 0, size.width + 30.0, size.height);
 
         CGRect frame = self.view.frame;
         frame.size = size;
@@ -1858,27 +1847,25 @@ static GameSurfaceView* pojavWindow;
 }
 
 - (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
-    BOOL handled = NO;
     for (UIPress *press in presses) {
-        if (press.key != nil && [KeyboardInput sendKeyEvent:press.key down:YES]) {
-            handled = YES;
+        if (press.key != nil) {
+            [KeyboardInput sendKeyEvent:press.key down:YES];
         }
     }
-    if (!handled) {
-        [super pressesBegan:presses withEvent:event];
-    }
+    // Always call super so that inputTextField (UITextInput) can receive
+    // key events for text input (e.g., Minecraft chat).
+    [super pressesBegan:presses withEvent:event];
 }
 
 - (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
-    BOOL handled = NO;
     for (UIPress *press in presses) {
-        if (press.key != nil && [KeyboardInput sendKeyEvent:press.key down:NO]) {
-            handled = YES;
+        if (press.key != nil) {
+            [KeyboardInput sendKeyEvent:press.key down:NO];
         }
     }
-    if (!handled) {
-        [super pressesEnded:presses withEvent:event];
-    }
+    // Always call super so that inputTextField (UITextInput) can receive
+    // key-up events properly.
+    [super pressesEnded:presses withEvent:event];
 }
 
 - (BOOL)prefersPointerLocked {
@@ -1888,9 +1875,10 @@ static GameSurfaceView* pojavWindow;
 - (void)registerMouseCallbacks:(GCMouse *)mouse {
     NSLog(@"Input: Got mouse %@", mouse);
     mouse.mouseInput.mouseMovedHandler = ^(GCMouseInput * _Nonnull mouse, float deltaX, float deltaY) {
-        if (!self.view.window.windowScene.pointerLockState.locked) {
-            return;
-        }
+        // Always forward mouse movement to the game.
+        // When pointer is locked (in-game grabbing), deltaX/deltaY are true deltas.
+        // When pointer is NOT locked (menu, or Bluetooth mouse before lock activates),
+        // we still send the delta so the virtual mouse or cursor can move.
         [self sendTouchPoint:CGPointMake(deltaX, -deltaY) withEvent:ACTION_MOVE_MOTION];
     };
 
@@ -2473,20 +2461,8 @@ static NSMutableDictionary *s_touchToFingerIdMap = nil;
     }
 
     // LAN 端口检测器已改为手动输入模式，stopDetecting 已移除，无需调用。
-    // 联机资源（SOCKS5 代理、PortForwarder、ZeroTier）的清理见下方 stopAllMultiplayerServices。
-
-    // 关键修复（P0-A）：游戏退出（存档关闭/JVM 结束）时清理联机资源
-    // 原代码仅停止 LanPortDetector，不清理联机相关的 SOCKS5 代理、端口转发器、
-    // ZeroTier 网络、AMETHYST_SOCKS5_PROXY 环境变量、PLProfiles 中的 serverIp。
-    // 这会导致"存档关闭后端口仍存在"和"下次进游戏必显示连接服务器"。
-    // 修复：在 dealloc 中调用 stopAllMultiplayerServices 彻底清理。
-    // 注意：dealloc 可能在异常路径触发，用 @try/@catch 防止二次崩溃。
-    @try {
-        [[MultiplayerManager sharedManager] stopAllMultiplayerServices];
-        NSLog(@"[SurfaceViewController] dealloc: 联机资源已清理");
-    } @catch (NSException *e) {
-        NSLog(@"[SurfaceViewController] dealloc: 清理联机资源异常：%@", e);
-    }
+    // ZeroTier/Terracotta 联机暂时移除：原 stopAllMultiplayerServices 调用注释掉
+    // [[MultiplayerManager sharedManager] stopAllMultiplayerServices];
 
     //æ¸ç TouchController èµæº
     if (self.touchControllerTransportHandle >= 0) {

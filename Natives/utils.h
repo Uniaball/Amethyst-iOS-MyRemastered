@@ -71,6 +71,8 @@ BOOL debugLogEnabled, isJailbroken;
 #define CS_DEBUGGED 0x10000000
 int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 BOOL isJITEnabled(BOOL checkCSOps);
+// legacy method used to check if we're using universal script
+void* JIT26CreateRegionLegacy(size_t len);
 // used for large memory regions
 void* JIT26PrepareRegion(void *addr, size_t len);
 // same as JIT26PrepareRegion, but used for smaller memory regions
@@ -78,20 +80,21 @@ void* JIT26PrepareRegion(void *addr, size_t len);
 void JIT26PrepareRegionForPatching(void *addr, size_t len);
 void JIT26SetDetachAfterFirstBr(BOOL value);
 void JIT26SendJITScript(NSString* script);
-BOOL DeviceRequiresTXMWorkaround(void);
+
+// Device JIT flags（同步自上游 AngelAuraMC/Amethyst-iOS）
+// 支持 iOS 26.6+ / 27 的现代 Preboot 路径 + ChipID 硬件 fallback + capability 查询
+typedef enum {
+    JIT_FLAG_IS_IOS_26 = 1 << 0,
+    JIT_FLAG_FORCE_MIRRORED = 1 << 1,
+    JIT_FLAG_HAS_TXM = 1 << 2,
+} JITFlags;
+JITFlags DeviceGetJITFlags(BOOL refresh);
+BOOL DeviceHasJITFlags(JITFlags flags);
+BOOL DeviceNeedsDebugJITMapping(void);
 
 // Init functions
 void init_bypassDyldLibValidation();
 void init_hookFunctions();
-
-// 主动预加载 libSDL3.dylib 并重绑定符号（MC 26.3-snapshot-4+ 需要）
-// 必须在 UIApplicationMain 之后调用（例如 launchMinecraft），避免 SDL3
-// constructor 在 UIApplication 启动前干扰 UIKit 初始化导致白屏
-void amethyst_preloadSDL3ForHook();
-
-// 检测 MC 版本是否使用 SDL3 窗口后端（MC 26.3-snapshot-4+ 从 GLFW 切换到 SDL3）
-// 供 SurfaceViewController 决定是否预加载 SDL3，避免为 GLFW 版本加载 libSDL3.dylib
-BOOL amethyst_isSDL3Version(NSString *versionId);
 
 // Zink (Mesa 25.0.7) + MoltenVK vertex stride 4 字节对齐 fix
 // 仅在 zink 渲染器被选中时激活（需在 AMETHYST_RENDERER 环境变量设置后调用）
@@ -107,6 +110,7 @@ BOOL PLPatchMachOPlatformForFile(const char *path);
 
 UIViewController* currentVC();
 void openLink(UIViewController* sender, NSURL* link);
+void handle_fatal_exit(int code);
 
 NSString* localize(NSString* key, NSString* comment);
 NSMutableDictionary* parseJSONFromFile(NSString *path);
